@@ -39,6 +39,29 @@ export default function App() {
   ]);
   const [selectedRiskLevel, setSelectedRiskLevel] = useState<RiskLevel | 'All'>('All');
   const [selectedBatch, setSelectedBatch] = useState<string>('all');
+  const [quotaExceeded, setQuotaExceeded] = useState<boolean>(false);
+  const [mapsApiKey, setMapsApiKey] = useState<string>(
+    (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || ''
+  );
+
+  // Listen for Google Maps quota limit events (Section 8 Client-Side Quota Defense)
+  useEffect(() => {
+    const handleQuota = () => setQuotaExceeded(true);
+    window.addEventListener('gmp-quota-exceeded', handleQuota);
+    return () => window.removeEventListener('gmp-quota-exceeded', handleQuota);
+  }, []);
+
+  // Retrieve Maps key from server config if not provided via Vite env
+  useEffect(() => {
+    if (!mapsApiKey) {
+      fetch('/api/config/maps-key')
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.apiKey) setMapsApiKey(data.apiKey);
+        })
+        .catch(() => {});
+    }
+  }, [mapsApiKey]);
 
   // Real-time streaming simulation effect
   useEffect(() => {
@@ -127,6 +150,24 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500/30 selection:text-sky-200">
+      {/* Google Maps Platform Quota Notice Banner (Section 8 Client-Side Quota Defense) */}
+      {quotaExceeded && (
+        <div className="bg-amber-500/10 border-b border-amber-500/30 text-amber-300 px-4 py-2.5 text-xs text-center sticky top-0 z-50 backdrop-blur-md">
+          <span>
+            Google Maps Platform quota reached. If you are the app owner, visit{' '}
+            <a
+              href="https://developers.google.com/maps/ai/ai-studio?utm_campaign=gmp_mcp_codeassist_v1_aistudio#quota_exceeded_errors"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline font-semibold text-amber-200 hover:text-white"
+            >
+              maps developer site
+            </a>{' '}
+            for instructions to update your account.
+          </span>
+        </div>
+      )}
+
       {/* Top Header */}
       <Header
         eventCount={filteredEvents.length}
@@ -175,6 +216,7 @@ export default function App() {
             <ThreatMapView
               events={filteredEvents}
               onSelectEvent={setSelectedEvent}
+              apiKey={mapsApiKey}
             />
           )}
 

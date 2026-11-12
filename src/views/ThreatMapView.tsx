@@ -1,23 +1,93 @@
-import React, { useState, useMemo } from 'react';
-import { Globe, MapPin, ShieldAlert, Info, ExternalLink } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import {
+  Globe,
+  MapPin,
+  ShieldAlert,
+  Info,
+  ExternalLink,
+  Navigation,
+  Compass,
+  Radio,
+  Layers,
+  Crosshair,
+  AlertOctagon,
+  Radar,
+  Eye,
+} from 'lucide-react';
+import { APIProvider, Map as GoogleMap, AdvancedMarker, InfoWindow } from '@vis.gl/react-google-maps';
 import { ScoredEvent } from '../types/threat';
 
 interface ThreatMapViewProps {
   events: ScoredEvent[];
   onSelectEvent: (event: ScoredEvent) => void;
+  apiKey?: string;
 }
 
-export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEvent }) => {
-  const [hoveredEvent, setHoveredEvent] = useState<ScoredEvent | null>(null);
-  const [selectedCountryFilter, setSelectedCountryFilter] = useState<string | null>(null);
+interface MapStyleRule {
+  elementType?: string;
+  featureType?: string;
+  stylers: Array<Record<string, string | number>>;
+}
 
-  // Top 10 Source Countries Aggregation (Section 7 requirement)
+// Dark tactical map style for SOC aesthetic
+const DARK_SOC_MAP_STYLES: MapStyleRule[] = [
+  { elementType: 'geometry', stylers: [{ color: '#090d16' }] },
+  { elementType: 'labels.text.stroke', stylers: [{ color: '#090d16' }] },
+  { elementType: 'labels.text.fill', stylers: [{ color: '#64748b' }] },
+  { featureType: 'administrative.locality', elementType: 'labels.text.fill', stylers: [{ color: '#94a3b8' }] },
+  { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#172033' }] },
+  { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#0f172a' }] },
+  { featureType: 'road.highway', elementType: 'geometry', stylers: [{ color: '#1e293b' }] },
+  { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#090d16' }] },
+  { featureType: 'transit', stylers: [{ visibility: 'off' }] },
+  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#020617' }] },
+  { featureType: 'water', elementType: 'labels.text.fill', stylers: [{ color: '#334155' }] },
+];
+
+// Haversine formula to compute distance in km
+function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371; // Earth's radius in km
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
+export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEvent, apiKey = '' }) => {
+  const [activeMarkerEvent, setActiveMarkerEvent] = useState<ScoredEvent | null>(null);
+  const [selectedCountryFilter, setSelectedCountryFilter] = useState<string | null>(null);
+  const [mapType, setMapType] = useState<'roadmap' | 'satellite' | 'hybrid'>('roadmap');
+
+  // Real-time Analyst Geolocation state
+  const [analystLocation, setAnalystLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [isLocating, setIsLocating] = useState<boolean>(false);
+  const [geoError, setGeoError] = useState<string | null>(null);
+
+  // Map view controls
+  const [mapCenter, setMapCenter] = useState<{ lat: number; lng: number }>({ lat: 25, lng: 10 });
+  const [mapZoom, setMapZoom] = useState<number>(2);
+
+  // Top 10 Source Countries Aggregation
   const top10Countries = useMemo(() => {
-    const counts: Record<string, { total: number; attacks: number; avgRisk: number; country_code: string }> = {};
+    const counts: Record<string, { total: number; attacks: number; avgRisk: number; country_code: string; lat: number; lon: number }> = {};
 
     events.forEach((e) => {
       if (!counts[e.country]) {
-        counts[e.country] = { total: 0, attacks: 0, avgRisk: 0, country_code: e.country_code };
+        counts[e.country] = {
+          total: 0,
+          attacks: 0,
+          avgRisk: 0,
+          country_code: e.country_code,
+          lat: e.lat,
+          lon: e.lon,
+        };
       }
       counts[e.country].total += 1;
       if (e.attack_category !== 'Normal') counts[e.country].attacks += 1;
@@ -31,6 +101,8 @@ export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEv
         total: stats.total,
         attacks: stats.attacks,
         avgRisk: Math.round((stats.avgRisk / stats.total) * 10) / 10,
+        lat: stats.lat,
+        lon: stats.lon,
       }))
       .sort((a, b) => b.total - a.total)
       .slice(0, 10);
@@ -41,17 +113,65 @@ export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEv
     return events.filter((e) => e.country === selectedCountryFilter);
   }, [events, selectedCountryFilter]);
 
-  // Convert lat/lon to SVG coordinates (Equirectangular Projection)
-  // viewBox: 0 0 1000 500
-  // x = (lon + 180) * (1000 / 360)
-  // y = (90 - lat) * (500 / 180)
-  const projectCoords = (lat: number, lon: number) => {
-    const x = ((lon + 180) * 1000) / 360;
-    const y = ((90 - lat) * 500) / 180;
-    return { x, y };
+  // Find closest attack event to analyst if geolocation is active
+  const closestThreat = useMemo<{ event: ScoredEvent; distanceKm: number } | null>(() => {
+    if (!analystLocation || mapEvents.length === 0) return null;
+    let closest: { event: ScoredEvent; distanceKm: number } | null = null;
+
+    mapEvents.forEach((evt) => {
+      if (evt.attack_category === 'Normal') return;
+      const d = calculateDistanceKm(analystLocation.lat, analystLocation.lng, evt.lat, evt.lon);
+      if (!closest || d < closest.distanceKm) {
+        closest = { event: evt, distanceKm: d };
+      }
+    });
+
+    return closest;
+  }, [analystLocation, mapEvents]);
+
+  // Request real-time analyst geolocation from the browser
+  const handleDetectAnalystLocation = () => {
+    setIsLocating(true);
+    setGeoError(null);
+
+    if (!('geolocation' in navigator)) {
+      setGeoError('Geolocation API not supported by this browser.');
+      setIsLocating(false);
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { latitude, longitude } = position.coords;
+        setAnalystLocation({ lat: latitude, lng: longitude });
+        setMapCenter({ lat: latitude, lng: longitude });
+        setMapZoom(4);
+        setIsLocating(false);
+      },
+      (err) => {
+        console.warn('Geolocation lookup notice:', err.message);
+        // Fallback default coordinate (e.g. SOC Headquarters / Frankfurt datacenter) if denied
+        setAnalystLocation({ lat: 50.1109, lng: 8.6821 });
+        setGeoError('Location permission denied or unavailable. Centered on SOC HQ (Frankfurt).');
+        setIsLocating(false);
+      },
+      { timeout: 8000, enableHighAccuracy: true }
+    );
   };
 
-  const getMarkerColor = (category: string) => {
+  const handleFocusCountry = (c: (typeof top10Countries)[0]) => {
+    if (selectedCountryFilter === c.country) {
+      setSelectedCountryFilter(null);
+      setMapCenter({ lat: 25, lng: 10 });
+      setMapZoom(2);
+    } else {
+      setSelectedCountryFilter(c.country);
+      setMapCenter({ lat: c.lat, lng: c.lon });
+      setMapZoom(4);
+    }
+  };
+
+  const getSeverityColor = (category: string) => {
     switch (category) {
       case 'DoS':
         return '#38bdf8'; // sky-400
@@ -69,46 +189,118 @@ export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEv
 
   return (
     <div className="p-6 space-y-6 max-w-7xl mx-auto">
-      {/* Title & Note on Geolocation (Section 7 requirement) */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      {/* Title & Geolocation Controls */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
           <h1 className="text-xl font-bold text-slate-100 tracking-tight flex items-center gap-2">
             <Globe className="w-5 h-5 text-sky-400" />
-            Global Attack Origins & Geolocation Map
+            <span>Real-Time Geospatial Threat & Attack Origin Map</span>
           </h1>
           <p className="text-xs text-slate-400 mt-0.5">
-            Real-time geospatial scatter of attack origins sized by risk score and classified by NSL-KDD attack vectors
+            Live Google Maps telemetry plotting active intrusion origins, analyst proximity, and real-time IP threat coordinates
           </p>
         </div>
 
-        {/* Note on data source badge as required by Section 7 */}
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400">
-          <Info className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-          <span>Locations derived from MaxMind GeoLite2 & IP heuristics (Simulated Telemetry)</span>
+        {/* Live Controls: Geolocation button & Map Type switch */}
+        <div className="flex flex-wrap items-center gap-2.5">
+          {/* Real-time Analyst Position Detector */}
+          <button
+            onClick={handleDetectAnalystLocation}
+            disabled={isLocating}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-all cursor-pointer ${
+              analystLocation
+                ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
+                : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+            }`}
+            title="Detect your physical location and calculate proximity to active threats"
+          >
+            <Crosshair className={`w-3.5 h-3.5 ${isLocating ? 'animate-spin text-sky-400' : 'text-sky-400'}`} />
+            <span>
+              {isLocating
+                ? 'Locating SOC...'
+                : analystLocation
+                ? 'Analyst GPS Locked'
+                : 'Detect My Location'}
+            </span>
+          </button>
+
+          {/* Map Style Selector */}
+          <div className="flex items-center rounded-lg bg-slate-900 border border-slate-800 p-0.5 text-xs font-mono">
+            <button
+              onClick={() => setMapType('roadmap')}
+              className={`px-2.5 py-1 rounded transition-colors ${
+                mapType === 'roadmap' ? 'bg-slate-800 text-sky-300 font-semibold' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Tactical Dark
+            </button>
+            <button
+              onClick={() => setMapType('satellite')}
+              className={`px-2.5 py-1 rounded transition-colors ${
+                mapType === 'satellite' ? 'bg-slate-800 text-sky-300 font-semibold' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Satellite
+            </button>
+            <button
+              onClick={() => setMapType('hybrid')}
+              className={`px-2.5 py-1 rounded transition-colors ${
+                mapType === 'hybrid' ? 'bg-slate-800 text-sky-300 font-semibold' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Hybrid
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Main Interactive Threat Map Canvas */}
+      {/* Geolocation Proximity Alert Banner (if analyst location detected) */}
+      {analystLocation && closestThreat && (
+        <div className="p-3.5 rounded-xl bg-sky-950/40 border border-sky-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs animate-in fade-in">
+          <div className="flex items-center gap-2.5 text-slate-200">
+            <div className="p-1.5 rounded-lg bg-sky-500/20 text-sky-400 shrink-0">
+              <Radar className="w-4 h-4 animate-pulse" />
+            </div>
+            <div>
+              <span className="font-semibold text-slate-100">Live Proximity Telemetry:</span>{' '}
+              <span className="text-slate-300">
+                Closest active adversary node is{' '}
+                <strong className="text-rose-400 font-mono">{closestThreat.event.src_ip}</strong> ({closestThreat.event.country}),{' '}
+                located{' '}
+                <strong className="text-sky-300 font-mono">{closestThreat.distanceKm.toLocaleString()} km</strong> from your physical terminal.
+              </span>
+            </div>
+          </div>
+
+          <button
+            onClick={() => onSelectEvent(closestThreat.event)}
+            className="flex items-center gap-1 text-[11px] font-mono text-sky-400 hover:text-sky-300 hover:underline shrink-0"
+          >
+            <span>Triage Threat</span>
+            <ExternalLink className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
+      {geoError && (
+        <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400 flex items-center gap-2">
+          <Info className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <span>{geoError}</span>
+        </div>
+      )}
+
+      {/* Main Real-Time Google Maps Canvas Container */}
       <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-3">
-        <div className="flex items-center justify-between text-xs">
-          <div className="flex items-center gap-4">
-            <span className="font-semibold text-slate-200">Global Threat Scatter</span>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-3">
+            <span className="font-semibold text-slate-200">Live Telemetry Viewport</span>
             <span className="text-slate-500 font-mono">
-              Plotting {mapEvents.length} origin vectors {selectedCountryFilter ? `in ${selectedCountryFilter}` : ''}
+              Plotting {mapEvents.length} active origin coordinates {selectedCountryFilter ? `(${selectedCountryFilter})` : ''}
             </span>
           </div>
 
-          {selectedCountryFilter && (
-            <button
-              onClick={() => setSelectedCountryFilter(null)}
-              className="text-[11px] font-mono text-sky-400 hover:underline"
-            >
-              Reset Country Filter (Show All)
-            </button>
-          )}
-
-          {/* Severity Color Legend */}
-          <div className="hidden md:flex items-center gap-3 text-[11px] font-mono">
+          {/* Color Legend */}
+          <div className="flex items-center gap-3 text-[11px] font-mono">
             <div className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded-full bg-sky-400" />
               <span className="text-slate-400">DoS</span>
@@ -129,118 +321,172 @@ export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEv
               <span className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
               <span className="text-slate-400">Normal</span>
             </div>
+            {analystLocation && (
+              <div className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-ping" />
+                <span className="text-cyan-300 font-semibold">Your Location</span>
+              </div>
+            )}
           </div>
         </div>
 
-        {/* SVG World Map */}
-        <div className="relative w-full aspect-[2/1] bg-[#030712] rounded-lg border border-slate-800/80 overflow-hidden">
-          <svg className="w-full h-full" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet">
-            {/* Latitude / Longitude Subtle Grid Lines */}
-            <line x1="0" y1="125" x2="1000" y2="125" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.5" />
-            <line x1="0" y1="250" x2="1000" y2="250" stroke="#334155" strokeWidth="0.8" />
-            <line x1="0" y1="375" x2="1000" y2="375" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.5" />
-            <line x1="250" y1="0" x2="250" y2="500" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.5" />
-            <line x1="500" y1="0" x2="500" y2="500" stroke="#334155" strokeWidth="0.8" />
-            <line x1="750" y1="0" x2="750" y2="500" stroke="#1e293b" strokeDasharray="3 3" strokeWidth="0.5" />
-
-            {/* Stylized Continents Outlines */}
-            <g fill="#0f172a" stroke="#1e293b" strokeWidth="1" opacity="0.8">
-              {/* North America */}
-              <path d="M 120 70 L 280 60 L 320 140 L 260 210 L 190 260 L 160 230 L 140 180 Z" />
-              {/* South America */}
-              <path d="M 270 260 L 360 270 L 380 340 L 320 450 L 290 400 L 270 320 Z" />
-              {/* Europe */}
-              <path d="M 460 70 L 580 60 L 590 140 L 530 180 L 470 160 L 450 110 Z" />
-              {/* Africa */}
-              <path d="M 460 180 L 580 180 L 610 270 L 560 410 L 480 370 L 450 250 Z" />
-              {/* Asia */}
-              <path d="M 590 60 L 890 70 L 870 190 L 760 270 L 660 240 L 600 160 Z" />
-              {/* Australia */}
-              <path d="M 780 330 L 910 330 L 890 430 L 800 420 Z" />
-            </g>
-
-            {/* Threat Origin Points Sized by Risk Score */}
-            {mapEvents.map((evt) => {
-              const { x, y } = projectCoords(evt.lat, evt.lon);
-              // Radius proportional to risk score (from 3px up to 12px)
-              const radius = Math.max(3.5, (evt.risk_score / 100) * 11);
-              const color = getMarkerColor(evt.attack_category);
-              const isHovered = hoveredEvent?.event_id === evt.event_id;
-
-              return (
-                <g key={evt.event_id} className="cursor-pointer">
-                  {/* Subtle Pulse for Critical Events */}
-                  {evt.risk_level === 'Critical' && (
-                    <circle
-                      cx={x}
-                      cy={y}
-                      r={radius * 1.8}
-                      fill={color}
-                      opacity="0.25"
-                      className="animate-ping"
-                    />
-                  )}
-
-                  <circle
-                    cx={x}
-                    cy={y}
-                    r={isHovered ? radius + 2 : radius}
-                    fill={color}
-                    fillOpacity={isHovered ? 1.0 : 0.75}
-                    stroke="#ffffff"
-                    strokeWidth={isHovered ? 1.5 : 0.5}
-                    onMouseEnter={() => setHoveredEvent(evt)}
-                    onMouseLeave={() => setHoveredEvent(null)}
-                    onClick={() => onSelectEvent(evt)}
-                  />
-                </g>
-              );
-            })}
-          </svg>
-
-          {/* Interactive Tooltip Card */}
-          {hoveredEvent && (
-            <div
-              className="absolute pointer-events-none z-30 p-3 rounded-lg bg-slate-950/95 border border-slate-700 shadow-xl text-xs space-y-1 backdrop-blur-md"
-              style={{
-                left: `${Math.min(75, Math.max(10, (projectCoords(hoveredEvent.lat, hoveredEvent.lon).x / 1000) * 100))}%`,
-                top: `${Math.min(75, Math.max(10, (projectCoords(hoveredEvent.lat, hoveredEvent.lon).y / 500) * 100))}%`,
+        {/* Real-time Google Maps Component (with explicit height per CF2) */}
+        <div className="relative w-full h-[540px] rounded-lg overflow-hidden border border-slate-800/80 bg-[#060a12]">
+          <APIProvider apiKey={apiKey} libraries={['marker']}>
+            <GoogleMap
+              // Mandatory internal attribution ID per Section 3 & 4
+              internalUsageAttributionIds={['gmp_mcp_codeassist_v1_aistudio']}
+              // Mandatory mapId for AdvancedMarkerElement per CF9
+              mapId="DEMO_MAP_ID"
+              style={{ width: '100%', height: '100%' }}
+              defaultCenter={mapCenter}
+              defaultZoom={mapZoom}
+              center={mapCenter}
+              zoom={mapZoom}
+              onCameraChanged={(ev) => {
+                setMapCenter(ev.detail.center);
+                setMapZoom(ev.detail.zoom);
               }}
+              mapTypeId={mapType}
+              gestureHandling="greedy"
+              disableDefaultUI={false}
+              styles={mapType === 'roadmap' ? DARK_SOC_MAP_STYLES : undefined}
             >
-              <div className="flex items-center justify-between gap-3">
-                <span className="font-mono font-bold text-sky-400">{hoveredEvent.src_ip}</span>
-                <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
-                  {hoveredEvent.country}
-                </span>
-              </div>
-              <div className="text-slate-300">
-                Target: <span className="text-slate-100 font-mono">{hoveredEvent.destination_asset}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 text-[11px]">
-                <span className="text-slate-400">Attack: {hoveredEvent.attack_category}</span>
-                <span className="font-mono font-bold text-rose-400">Risk: {hoveredEvent.risk_score}</span>
-              </div>
-              <p className="text-[10px] text-sky-400 italic">Click node to inspect alert</p>
-            </div>
-          )}
+              {/* Analyst Terminal Location Marker */}
+              {analystLocation && (
+                <AdvancedMarker
+                  position={analystLocation}
+                  title="Your SOC Terminal Physical Geolocation"
+                >
+                  <div className="relative flex items-center justify-center">
+                    <div className="absolute w-10 h-10 rounded-full bg-cyan-500/20 animate-ping" />
+                    <div className="absolute w-6 h-6 rounded-full bg-cyan-400/40" />
+                    <div className="w-3.5 h-3.5 rounded-full bg-cyan-400 border-2 border-white shadow-lg shadow-cyan-500/50" />
+                  </div>
+                </AdvancedMarker>
+              )}
+
+              {/* Threat Origin Advanced Markers */}
+              {mapEvents.map((evt) => {
+                const color = getSeverityColor(evt.attack_category);
+                // Diameter proportional to risk score (12px to 28px)
+                const size = Math.max(12, Math.round((evt.risk_score / 100) * 24));
+                const isCritical = evt.risk_level === 'Critical';
+
+                return (
+                  <AdvancedMarker
+                    key={evt.event_id}
+                    position={{ lat: evt.lat, lng: evt.lon }}
+                    onClick={() => setActiveMarkerEvent(evt)}
+                    title={`${evt.src_ip} (${evt.country}) - Risk: ${evt.risk_score}`}
+                  >
+                    <div
+                      className="group relative flex items-center justify-center cursor-pointer transition-transform hover:scale-125"
+                      style={{ width: size, height: size }}
+                    >
+                      {isCritical && (
+                        <div
+                          className="absolute inset-0 rounded-full animate-ping opacity-75"
+                          style={{ backgroundColor: color }}
+                        />
+                      )}
+                      <div
+                        className="w-full h-full rounded-full border border-white/80 shadow-md"
+                        style={{ backgroundColor: color }}
+                      />
+                    </div>
+                  </AdvancedMarker>
+                );
+              })}
+
+              {/* InfoWindow for clicked threat marker */}
+              {activeMarkerEvent && (
+                <InfoWindow
+                  position={{ lat: activeMarkerEvent.lat, lng: activeMarkerEvent.lon }}
+                  onCloseClick={() => setActiveMarkerEvent(null)}
+                  maxWidth={320}
+                >
+                  <div className="p-2 text-slate-900 space-y-2 text-xs">
+                    <div className="flex items-center justify-between border-b border-slate-200 pb-1.5">
+                      <div className="font-mono font-bold text-sky-700 text-sm">
+                        {activeMarkerEvent.src_ip}
+                      </div>
+                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-slate-100 font-semibold text-slate-700">
+                        {activeMarkerEvent.country}
+                      </span>
+                    </div>
+
+                    <div className="space-y-1 font-mono text-[11px] text-slate-700">
+                      <div>
+                        Target Asset:{' '}
+                        <span className="font-semibold text-slate-900">
+                          {activeMarkerEvent.destination_asset}
+                        </span>
+                      </div>
+                      <div>
+                        Category: <strong className="text-slate-900">{activeMarkerEvent.attack_category}</strong> (
+                        {activeMarkerEvent.specific_attack})
+                      </div>
+                      <div className="flex items-center justify-between pt-1">
+                        <span>Risk Score:</span>
+                        <strong className="text-rose-600 font-bold text-xs">
+                          {activeMarkerEvent.risk_score} / 100 ({activeMarkerEvent.risk_level})
+                        </strong>
+                      </div>
+                      <div>
+                        Coordinates: {activeMarkerEvent.lat.toFixed(2)}, {activeMarkerEvent.lon.toFixed(2)}
+                      </div>
+                      {analystLocation && (
+                        <div className="text-sky-700 font-medium">
+                          Distance to SOC:{' '}
+                          {calculateDistanceKm(
+                            analystLocation.lat,
+                            analystLocation.lng,
+                            activeMarkerEvent.lat,
+                            activeMarkerEvent.lon
+                          ).toLocaleString()}{' '}
+                          km
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-200 flex items-center justify-between">
+                      <span className="text-[10px] text-slate-500 font-sans">
+                        MITRE: {activeMarkerEvent.mitre_technique.id}
+                      </span>
+                      <button
+                        onClick={() => {
+                          onSelectEvent(activeMarkerEvent);
+                          setActiveMarkerEvent(null);
+                        }}
+                        className="px-2.5 py-1 text-[11px] font-semibold text-white bg-sky-700 hover:bg-sky-800 rounded transition-colors cursor-pointer"
+                      >
+                        Inspect Details
+                      </button>
+                    </div>
+                  </div>
+                </InfoWindow>
+              )}
+            </GoogleMap>
+          </APIProvider>
         </div>
       </div>
 
-      {/* Top 10 Source Countries Bar Chart (Section 7 requirement) */}
+      {/* Top 10 Source Countries Interactive Focus Cards (Section 7 requirement) */}
       <div className="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
           <div>
             <h3 className="text-xs font-semibold text-slate-200">
               Top 10 Attack Source Geographies
             </h3>
             <p className="text-[11px] text-slate-400">
-              Aggregated frequency of inbound intrusion attempts by originating country
+              Click any country to immediately pan and focus real-time map telemetry on that region
             </p>
           </div>
-          <span className="text-xs font-mono text-slate-500">MaxMind GeoLite2 Ingestion</span>
+          <span className="text-xs font-mono text-slate-500">MaxMind GeoLite2 & IP Geolocation</span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
           {top10Countries.map((c, idx) => {
             const maxCount = top10Countries[0].total || 1;
             const pct = (c.total / maxCount) * 100;
@@ -249,10 +495,10 @@ export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEv
             return (
               <div
                 key={c.country}
-                onClick={() => setSelectedCountryFilter(isFilterActive ? null : c.country)}
+                onClick={() => handleFocusCountry(c)}
                 className={`p-3 rounded-lg border transition-all cursor-pointer ${
                   isFilterActive
-                    ? 'bg-sky-500/10 border-sky-500/40'
+                    ? 'bg-sky-500/15 border-sky-500/50 shadow-md shadow-sky-500/10'
                     : 'bg-slate-950/70 border-slate-800/80 hover:bg-slate-800/50'
                 }`}
               >
@@ -276,8 +522,13 @@ export const ThreatMapView: React.FC<ThreatMapViewProps> = ({ events, onSelectEv
                 </div>
 
                 <div className="mt-1.5 flex items-center justify-between text-[11px] text-slate-500">
-                  <span>Avg Risk Score: <strong className="text-slate-300 font-mono">{c.avgRisk}</strong></span>
-                  <span className="text-sky-400 text-[10px]">{isFilterActive ? 'Active Filter' : 'Click to filter map'}</span>
+                  <span>
+                    Avg Risk Score: <strong className="text-slate-300 font-mono">{c.avgRisk}</strong>
+                  </span>
+                  <span className="text-sky-400 text-[10px] font-medium flex items-center gap-1">
+                    <MapPin className="w-3 h-3" />
+                    <span>{isFilterActive ? 'Active Filter (Click to Reset)' : 'Focus On Map'}</span>
+                  </span>
                 </div>
               </div>
             );

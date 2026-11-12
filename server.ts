@@ -129,6 +129,16 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// Maps API key configuration endpoint
+app.get('/api/config/maps-key', (_req, res) => {
+  const apiKey =
+    process.env.VITE_GOOGLE_MAPS_API_KEY ||
+    process.env.GOOGLE_MAPS_API_KEY ||
+    process.env.GMP_API_KEY ||
+    '';
+  res.json({ apiKey });
+});
+
 // Dev / Prod Vite server integration
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
