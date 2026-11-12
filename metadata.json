@@ -1,0 +1,6 @@
+{
+  "name": "AI-Based Threat Intelligence Dashboard",
+  "description": "Production-grade SOC dashboard scoring network traffic (NSL-KDD), detecting anomalies with Isolation Forest, extracting IOCs, and mapping threats to MITRE ATT&CK techniques with Gemini AI analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
