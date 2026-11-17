@@ -42,7 +42,7 @@ export function extractIOCs(text: string): ExtractedIOCs {
   if (!text) return { ips: [], domains: [], hashes: [], cves: [] };
 
   // IPv4 extraction with octet boundary validation (0-255)
-  const rawIps = text.match(IPV4_REGEX) || [];
+  const rawIps: string[] = text.match(IPV4_REGEX) ?? [];
   const validIps = Array.from(new Set(
     rawIps.filter((ip) => {
       const octets = ip.split('.').map(Number);
