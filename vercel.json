@@ -9,8 +9,8 @@
     "api": {
       "root": ".",
       "framework": "express",
-      "buildCommand": "esbuild server.ts --platform=node --bundle --format=esm --outfile=dist-api/server.js --packages=external",
-      "entrypoint": "dist-api/server.js"
+      "buildCommand": "node --check server.js",
+      "entrypoint": "server.js"
     },
     "threat-dashboard": {
       "root": "threat-dashboard",

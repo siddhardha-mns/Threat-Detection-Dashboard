@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -26,7 +26,7 @@ const ai = new GoogleGenAI({
 });
 
 // Threat intelligence report AI analysis endpoint
-app.post('/api/gemini/analyze-report', async (req: Request, res: Response) => {
+app.post('/api/gemini/analyze-report', async (req, res) => {
   try {
     const { reportText, extractedIocs, mitreMatches } = req.body;
 
@@ -50,7 +50,7 @@ app.post('/api/gemini/analyze-report', async (req: Request, res: Response) => {
           'Payload staging and Command & Control callback',
           'Credential Harvesting & Lateral Movement attempts',
         ],
-        primaryTTPs: (mitreMatches || []).map((m: any) => `${m.technique_id} - ${m.name}`),
+        primaryTTPs: (mitreMatches || []).map((m) => `${m.technique_id} - ${m.name}`),
         containmentPlaybook: [
           'Block all identified IP addresses at the perimeter firewall / egress gateway',
           'Null-route identified external malicious domains in internal DNS resolvers',
@@ -109,14 +109,14 @@ Provide a comprehensive, actionable CTI assessment formatted strictly as valid J
         executiveSummary: text.slice(0, 300),
         threatActorHypothesis: 'Advanced Persistent Threat (APT)',
         attackChain: ['Initial Compromise', 'C2 Establishment', 'Impact'],
-        primaryTTPs: (mitreMatches || []).map((m: any) => `${m.technique_id}: ${m.name}`),
+        primaryTTPs: (mitreMatches || []).map((m) => `${m.technique_id}: ${m.name}`),
         containmentPlaybook: ['Isolate affected endpoints', 'Block suspect IPs', 'Revoke credentials'],
         severityAssessment: 'High',
       };
     }
 
     res.json(parsedData);
-  } catch (err: any) {
+  } catch (err) {
     console.error('Gemini CTI Analysis Error:', err);
     res.status(500).json({
       error: 'Failed to generate CTI analysis with Gemini',
